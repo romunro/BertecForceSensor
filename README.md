@@ -32,6 +32,7 @@ To keep the raw dynamics untouched for your controller's own filtering while pre
 2. **Non-Blocking Buffer Drain (Zero Backlog Lag):** On every wakeup, the reader thread drains all bytes currently available in the kernel tty buffer and publishes the newest complete frame, preventing stale backlog accumulation after OS scheduling jitter.
 3. **Wire-Corruption Sanity Guard (`max_range_multiplier: 3.0`):** Because the AM6817-E protocol has no hardware CRC byte, frames whose calibrated wrench exceeds `3.0 × [Ranges]` (or contains NaN/Inf from a UART bit flip) are rejected and counted in `<sensor_name>_corrupted_frames`.
 4. **Glitch-Free Thread-Safe Tare:** All tare state and baseline updates happen under a single mutex lock per batch, and wrench output is held at zero while a live tare is accumulating to avoid a step discontinuity.
+5. **Automatic Hot-Plug Reconnection (`ttyUSB0` / `ttyUSB1` Auto-Discovery):** When the USB cable is unplugged, the reader thread immediately closes the stale file descriptor (within 100 ms) so Linux releases the `ttyUSB` minor device node, and polls every 200 ms to reconnect. Even if Linux re-enumerates the device as `/dev/ttyUSB1`, `resolveDevicePath()` automatically locates it via `/dev/serial/by-id/usb-Bertec_Corporation_AM6817-E-if00-port0`, re-applies `1,500,000` baud + `1 ms` low-latency mode, preserves your existing calibration and tare baseline, restarts the 1 kHz stream (`0x06 0x00`), and resumes publishing and logging.
 
 ---
 

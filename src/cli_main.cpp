@@ -45,7 +45,8 @@ int main(int argc, char ** argv)
     const auto info = dev.getInfo();
     const auto cal = dev.readCalibration();
 
-    std::cout << "Model:       " << cal.model << "\n"
+    std::cout << "Port:        " << dev.activePort() << " (configured: " << port << ")\n"
+              << "Model:       " << cal.model << "\n"
               << "Serial:      " << info.serial << "\n"
               << "Sample rate: " << info.sample_rate_hz << " Hz (" << static_cast<int>(info.num_channels)
               << " channels)\n";

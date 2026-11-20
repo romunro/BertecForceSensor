@@ -55,12 +55,12 @@ void BertecForceSensor::init(mc_control::MCGlobalController & controller, const 
           "[BertecForceSensor] FTDI latency_timer on {} is {} ms (expected 1 ms). "
           "Frames will still stream at 1000 Hz avg, but arrive in ~3-4 ms USB micro-batches. "
           "Run `echo 1 | sudo tee /sys/bus/usb-serial/devices/ttyUSB0/latency_timer` or add a udev rule.",
-          port_, latency_ms);
+          device_->activePort(), latency_ms);
     }
     const auto info = device_->getInfo();
     const auto cal = device_->readCalibration();
     mc_rtc::log::success("[BertecForceSensor] Connected to {} (model: {}, serial: {}, rate: {} Hz)",
-                         port_, cal.model, info.serial, info.sample_rate_hz);
+                         device_->activePort(), cal.model, info.serial, info.sample_rate_hz);
 
     if(tare_samples_ > 0)
     {
@@ -76,7 +76,11 @@ void BertecForceSensor::init(mc_control::MCGlobalController & controller, const 
   {
     connected_ = false;
     stale_ = true;
-    mc_rtc::log::error("[BertecForceSensor] Failed to initialize on {}: {}", port_, e.what());
+    stale_warned_ = true;
+    mc_rtc::log::warning(
+        "[BertecForceSensor] Initial connection on {} failed ({}); background auto-reconnect enabled.",
+        port_, e.what());
+    device_->startAsync(static_cast<std::size_t>(std::max(0, tare_samples_)));
   }
 
   registerDatastore(controller);
@@ -134,8 +138,9 @@ void BertecForceSensor::after(mc_control::MCGlobalController & /*controller*/) {
 
 void BertecForceSensor::updateWrench()
 {
-  if(!connected_ || !device_)
+  if(!device_)
   {
+    connected_ = false;
     stale_ = true;
     if(zero_on_stale_)
     {
@@ -151,7 +156,12 @@ void BertecForceSensor::updateWrench()
 
   if(s.sample_count == 0)
   {
+    connected_ = false;
     stale_ = true;
+    if(zero_on_stale_)
+    {
+      wrench_ = sva::ForceVecd::Zero();
+    }
     return;
   }
 
@@ -163,11 +173,12 @@ void BertecForceSensor::updateWrench()
 
   if(!healthy)
   {
+    connected_ = false;
     stale_ = true;
     if(!stale_warned_)
     {
-      mc_rtc::log::error("[BertecForceSensor] Sensor stream stale or disconnected (age: {:.1f} ms > {:.1f} ms)",
-                         sample_age_ms_, watchdog_timeout_ms_);
+      mc_rtc::log::error("[BertecForceSensor] Sensor stream stale or disconnected on {} (age: {:.1f} ms)",
+                         device_->activePort(), sample_age_ms_);
       stale_warned_ = true;
     }
     if(zero_on_stale_)
@@ -179,9 +190,11 @@ void BertecForceSensor::updateWrench()
 
   if(stale_warned_)
   {
-    mc_rtc::log::success("[BertecForceSensor] Sensor stream recovered (age: {:.2f} ms)", sample_age_ms_);
+    mc_rtc::log::success("[BertecForceSensor] Sensor stream recovered on {} (reconnects: {}, age: {:.2f} ms)",
+                         device_->activePort(), s.reconnect_count, sample_age_ms_);
     stale_warned_ = false;
   }
+  connected_ = true;
   stale_ = false;
 
   wrench_ = sva::ForceVecd(Eigen::Vector3d(s.wrench[3], s.wrench[4], s.wrench[5]),
@@ -245,14 +258,14 @@ void BertecForceSensor::addGui(mc_control::MCGlobalController & controller)
   }
   gui->addElement(
       {"Plugins", "BertecForceSensor"},
-      mc_rtc::gui::Label("Port", [this]() { return port_; }),
+      mc_rtc::gui::Label("Port", [this]() { return device_ ? device_->activePort() : port_; }),
       mc_rtc::gui::Label("Status",
                          [this]() {
-                           if(!connected_)
+                           if(!connected_ || stale_)
                            {
-                             return "Disconnected";
+                             return "DISCONNECTED / STALE (Auto-reconnecting...)";
                            }
-                           return stale_ ? "STALE / TIMEOUT" : "Streaming (OK)";
+                           return "Streaming (OK)";
                          }),
       mc_rtc::gui::ArrayLabel("Force [N]", {"Fx", "Fy", "Fz"},
                               [this]() -> const Eigen::Vector3d & { return wrench_.force(); }),

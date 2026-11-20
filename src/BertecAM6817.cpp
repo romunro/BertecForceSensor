@@ -28,11 +28,14 @@ constexpr uint8_t kEscByte = 0x7D;
 constexpr uint8_t kEscXor = 0x20;
 constexpr std::size_t kPayloadSize = 17; // 1 byte seq + 8 * uint16 LE
 constexpr std::size_t kMaxRxBufBytes = 16384;
+constexpr int kStreamPollTimeoutMs = 100;
+constexpr int kReconnectIntervalMs = 200;
 
 constexpr uint8_t kCmdStopPing = 0x01;
 constexpr uint8_t kCmdGetInfo = 0x02;
 constexpr uint8_t kCmdGetCalibration = 0x03;
 constexpr uint8_t kCmdStartStream[2] = {0x06, 0x00};
+constexpr const char * kBertecByIdPath = "/dev/serial/by-id/usb-Bertec_Corporation_AM6817-E-if00-port0";
 
 uint16_t readU16LE(const uint8_t * p)
 {
@@ -150,7 +153,7 @@ CalibrationData parseCalibrationText(const std::string & text)
 } // namespace
 
 BertecAM6817::BertecAM6817(std::string port, int timeout_ms)
-: port_(std::move(port)), timeout_ms_(timeout_ms)
+: port_(std::move(port)), active_port_(port_), timeout_ms_(timeout_ms)
 {
   rx_buf_.reserve(4096);
 }
@@ -160,6 +163,91 @@ BertecAM6817::~BertecAM6817()
   close();
 }
 
+std::string BertecAM6817::resolveDevicePath() const
+{
+  std::error_code ec;
+
+  // 1. If configured port exists and is explicitly a Bertec AM6817 device, use it
+  auto is_bertec_tty = [](const std::string & dev_path) -> bool {
+    std::error_code local_ec;
+    if(!std::filesystem::exists(dev_path, local_ec))
+    {
+      return false;
+    }
+    const auto canon = std::filesystem::weakly_canonical(dev_path, local_ec);
+    const auto tty_name = (local_ec ? std::filesystem::path(dev_path) : canon).filename().string();
+    std::ifstream prod("/sys/bus/usb-serial/devices/" + tty_name + "/../../product");
+    std::string line;
+    if(prod && std::getline(prod, line) && line.find("AM6817") != std::string::npos)
+    {
+      return true;
+    }
+    return false;
+  };
+
+  if(!port_.empty() && port_ != "auto" && is_bertec_tty(port_))
+  {
+    const auto canon = std::filesystem::weakly_canonical(port_, ec);
+    return ec ? port_ : canon.string();
+  }
+
+  // 2. Check /dev/serial/by-id symlink for Bertec AM6817-E
+  if(std::filesystem::exists(kBertecByIdPath, ec))
+  {
+    const auto canon = std::filesystem::weakly_canonical(kBertecByIdPath, ec);
+    return ec ? std::string(kBertecByIdPath) : canon.string();
+  }
+  if(std::filesystem::exists("/dev/serial/by-id", ec))
+  {
+    for(const auto & entry : std::filesystem::directory_iterator("/dev/serial/by-id", ec))
+    {
+      const auto name = entry.path().filename().string();
+      if(name.find("Bertec") != std::string::npos || name.find("AM6817") != std::string::npos)
+      {
+        const auto canon = std::filesystem::weakly_canonical(entry.path(), ec);
+        return ec ? entry.path().string() : canon.string();
+      }
+    }
+  }
+
+  // 3. Scan /sys/bus/usb-serial/devices/ttyUSB* for product "AM6817"
+  if(std::filesystem::exists("/sys/bus/usb-serial/devices", ec))
+  {
+    for(const auto & entry : std::filesystem::directory_iterator("/sys/bus/usb-serial/devices", ec))
+    {
+      const auto tty_name = entry.path().filename().string();
+      const std::string candidate = "/dev/" + tty_name;
+      if(is_bertec_tty(candidate))
+      {
+        return candidate;
+      }
+    }
+  }
+
+  // 4. Fallback to configured port if it exists
+  if(!port_.empty() && port_ != "auto" && std::filesystem::exists(port_, ec))
+  {
+    return port_;
+  }
+  return port_.empty() ? "/dev/ttyUSB0" : port_;
+}
+
+std::string BertecAM6817::activePort() const
+{
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  return active_port_;
+}
+
+void BertecAM6817::closeFdOnly() noexcept
+{
+  if(fd_ >= 0)
+  {
+    ::close(fd_);
+    fd_ = -1;
+  }
+  rx_buf_.clear();
+}
+
 void BertecAM6817::open()
 {
   if(fd_ >= 0)
@@ -167,10 +255,15 @@ void BertecAM6817::open()
     return;
   }
 
-  fd_ = ::open(port_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+  const std::string resolved = resolveDevicePath();
+  fd_ = ::open(resolved.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
   if(fd_ < 0)
   {
-    throw std::runtime_error("Failed to open " + port_ + ": " + std::strerror(errno));
+    throw std::runtime_error("Failed to open " + resolved + ": " + std::strerror(errno));
+  }
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    active_port_ = resolved;
   }
 
   // Attempt to enable FTDI 1 ms low-latency mode before configuring termios baud rate
@@ -185,7 +278,7 @@ void BertecAM6817::open()
     if(latencyTimerMs() > 1)
     {
       std::error_code ec;
-      const auto tty_name = std::filesystem::weakly_canonical(port_, ec).filename().string();
+      const auto tty_name = std::filesystem::weakly_canonical(resolved, ec).filename().string();
       if(!tty_name.empty())
       {
         std::ofstream ofs("/sys/bus/usb-serial/devices/" + tty_name + "/latency_timer");
@@ -200,9 +293,8 @@ void BertecAM6817::open()
   termios attrs{};
   if(::tcgetattr(fd_, &attrs) != 0)
   {
-    ::close(fd_);
-    fd_ = -1;
-    throw std::runtime_error("tcgetattr failed on " + port_ + ": " + std::strerror(errno));
+    closeFdOnly();
+    throw std::runtime_error("tcgetattr failed on " + resolved + ": " + std::strerror(errno));
   }
 
   attrs.c_iflag = 0;
@@ -214,16 +306,14 @@ void BertecAM6817::open()
 
   if(::cfsetispeed(&attrs, B1500000) != 0 || ::cfsetospeed(&attrs, B1500000) != 0)
   {
-    ::close(fd_);
-    fd_ = -1;
-    throw std::runtime_error("Failed to set 1500000 baud on " + port_);
+    closeFdOnly();
+    throw std::runtime_error("Failed to set 1500000 baud on " + resolved);
   }
 
   if(::tcsetattr(fd_, TCSANOW, &attrs) != 0)
   {
-    ::close(fd_);
-    fd_ = -1;
-    throw std::runtime_error("tcsetattr failed on " + port_ + ": " + std::strerror(errno));
+    closeFdOnly();
+    throw std::runtime_error("tcsetattr failed on " + resolved + ": " + std::strerror(errno));
   }
 
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -233,7 +323,8 @@ void BertecAM6817::open()
 int BertecAM6817::latencyTimerMs() const
 {
   std::error_code ec;
-  const auto tty_name = std::filesystem::weakly_canonical(port_, ec).filename().string();
+  const std::string path = (fd_ >= 0) ? activePort() : resolveDevicePath();
+  const auto tty_name = std::filesystem::weakly_canonical(path, ec).filename().string();
   if(tty_name.empty())
   {
     return -1;
@@ -259,10 +350,8 @@ void BertecAM6817::close()
     catch(...)
     {
     }
-    ::close(fd_);
-    fd_ = -1;
+    closeFdOnly();
   }
-  rx_buf_.clear();
 }
 
 std::vector<uint8_t> BertecAM6817::readExact(std::size_t n, int timeout_ms)
@@ -309,7 +398,7 @@ std::vector<uint8_t> BertecAM6817::readExact(std::size_t n, int timeout_ms)
     {
       rx_buf_.insert(rx_buf_.end(), buf, buf + got);
     }
-    else if(got == 0 || (got < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+    else if(got < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
     {
       throw std::runtime_error("Serial read failed or device disconnected");
     }
@@ -576,16 +665,33 @@ void BertecAM6817::tareBlocking(std::size_t n_samples)
   {
     baseline_[c] = accum[c] / static_cast<double>(n_samples);
   }
+  has_baseline_ = true;
 }
 
-void BertecAM6817::startAsync()
+void BertecAM6817::startAsync(std::size_t initial_tare_samples)
 {
   if(running_.load())
   {
     return;
   }
-  startStream();
-  stream_healthy_.store(true);
+  initial_tare_samples_ = initial_tare_samples;
+  if(fd_ >= 0)
+  {
+    try
+    {
+      startStream();
+      stream_healthy_.store(true);
+    }
+    catch(...)
+    {
+      closeFdOnly();
+      stream_healthy_.store(false);
+    }
+  }
+  else
+  {
+    stream_healthy_.store(false);
+  }
   running_.store(true);
   reader_thread_ = std::thread(&BertecAM6817::readerLoop, this);
 }
@@ -628,6 +734,31 @@ Sample BertecAM6817::latestSample() const
   return latest_;
 }
 
+bool BertecAM6817::tryReconnect()
+{
+  closeFdOnly();
+  try
+  {
+    open();
+    if(!calibration_.valid)
+    {
+      getInfo();
+      readCalibration();
+    }
+    if(!has_baseline_ && initial_tare_samples_ > 0)
+    {
+      requestTare(initial_tare_samples_);
+    }
+    startStream();
+    return true;
+  }
+  catch(...)
+  {
+    closeFdOnly();
+    return false;
+  }
+}
+
 void BertecAM6817::readerLoop()
 {
   // Best-effort attempt to elevate reader thread to SCHED_FIFO real-time priority
@@ -638,13 +769,28 @@ void BertecAM6817::readerLoop()
   uint64_t count = 0;
   uint64_t dropped = 0;
   uint64_t corrupted = 0;
+  uint64_t reconnects = 0;
 
   while(running_.load())
   {
+    if(fd_ < 0)
+    {
+      stream_healthy_.store(false);
+      if(tryReconnect())
+      {
+        ++reconnects;
+      }
+      else
+      {
+        std::this_thread::sleep_for(std::chrono::milliseconds(kReconnectIntervalMs));
+      }
+      continue;
+    }
+
     try
     {
       pollfd pfd{fd_, POLLIN, 0};
-      const int rc = ::poll(&pfd, 1, timeout_ms_);
+      const int rc = ::poll(&pfd, 1, kStreamPollTimeoutMs);
       if(rc < 0)
       {
         if(errno == EINTR)
@@ -653,15 +799,11 @@ void BertecAM6817::readerLoop()
         }
         throw std::runtime_error("poll failed in readerLoop");
       }
-      if(rc == 0)
+      if(rc == 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)))
       {
+        // Close fd immediately so Linux releases the ttyUSB minor node before the cable is plugged back in
         stream_healthy_.store(false);
-        continue;
-      }
-      if(pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
-      {
-        stream_healthy_.store(false);
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        closeFdOnly();
         continue;
       }
 
@@ -701,6 +843,7 @@ void BertecAM6817::readerLoop()
             {
               baseline_[c] = tare_accum_[c] / static_cast<double>(tare_total_);
             }
+            has_baseline_ = true;
           }
         }
 
@@ -719,6 +862,7 @@ void BertecAM6817::readerLoop()
         newest.sample_count = count;
         newest.dropped_frames = dropped;
         newest.corrupted_frames = corrupted;
+        newest.reconnect_count = reconnects;
         newest.timestamp = now;
         got_any = true;
       }
@@ -732,11 +876,11 @@ void BertecAM6817::readerLoop()
     catch(...)
     {
       stream_healthy_.store(false);
+      closeFdOnly();
       if(!running_.load())
       {
         break;
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
   }
 }
