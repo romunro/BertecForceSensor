@@ -69,7 +69,7 @@ Create a new extension file in `<superbuild>/extensions/bertec_force_sensor.cmak
 
 ```cmake
 AddProject(bertec_force_sensor
-  GITHUB_PRIVATE <your-org-or-user>/force_sensor
+  GITHUB_PRIVATE romunro/BertecForceSensor
   GIT_TAG origin/main
   DEPENDS mc_rtc
 )
@@ -78,12 +78,6 @@ AddProject(bertec_force_sensor
 *(Or use `GIT_REPOSITORY <git-url>` instead of `GITHUB_PRIVATE` if hosted outside GitHub or locally.)*
 
 Then build/update via the superbuild:
-
-```bash
-cd <superbuild>/build
-cmake ..
-cmake --build . --target bertec_force_sensor
-```
 
 This will build and install `BertecForceSensor.so`, `libbertec_am6817.so`, and `etc/BertecForceSensor.yaml` into your superbuild `install/` prefix.
 
