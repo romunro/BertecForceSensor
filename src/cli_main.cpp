@@ -36,6 +36,12 @@ int main(int argc, char ** argv)
   {
     bertec::BertecAM6817 dev(port);
     dev.open();
+    const int latency_ms = dev.latencyTimerMs();
+    if(latency_ms > 1)
+    {
+      std::cerr << "Warning: FTDI latency_timer on " << port << " is " << latency_ms
+                << " ms (expected 1 ms); frames may arrive in ~3-4 ms USB batches.\n";
+    }
     const auto info = dev.getInfo();
     const auto cal = dev.readCalibration();
 

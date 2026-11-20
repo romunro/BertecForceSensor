@@ -24,13 +24,31 @@ Works with any `mc_rtc` runner (`mc_rtc_ticker`, `mc_mujoco`, `kortex`, etc.) an
   - `0x03`: Read 1024-byte calibration EEPROM (6×8 calibration matrix, `[Ranges]`, `[Nameplate]`)
   - `0x06 0x00`: Start 1 kHz stream (`0x7E`-delimited HDLC frames with `0x7D` / `XOR 0x20` byte-stuffing, 1-byte `seq` counter, and `8 × uint16` LE ADC counts)
 
-### USB Permissions (udev)
+### USB Permissions & Low-Latency Mode (udev)
 
 Ensure your user is in the `dialout` group so `/dev/ttyUSB0` is accessible without `sudo`:
 
 ```bash
 sudo usermod -aG dialout $USER
 # Log out and back in for group membership to take effect
+```
+
+#### FTDI `latency_timer` (Important for 1 kHz closed-loop control)
+
+Linux's `ftdi_sio` driver defaults to `latency_timer = 16 ms`. At 1000 Hz (18 bytes/frame), the FTDI chip flushes its 64-byte USB buffer every ~3–4 frames, so **average throughput is 1000 Hz with 0 drops, but frames arrive in ~3–4 ms micro-batches**.
+
+`BertecAM6817::open()` automatically attempts to enable `ASYNC_LOW_LATENCY` (`1 ms`) via `TIOCSSERIAL` and sysfs, and logs a warning if `latency_timer` remains `> 1 ms`. To make `1 ms` latency persistent without `sudo` at runtime, add a `udev` rule:
+
+```bash
+echo 'ACTION=="add", SUBSYSTEM=="usb-serial", DRIVER=="ftdi_sio", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", ATTR{latency_timer}="1"' | \
+  sudo tee /etc/udev/rules.d/99-bertec-ftdi-latency.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Or set it temporarily for the current session:
+
+```bash
+echo 1 | sudo tee /sys/bus/usb-serial/devices/ttyUSB0/latency_timer
 ```
 
 ---

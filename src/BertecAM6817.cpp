@@ -5,9 +5,13 @@
 #include <chrono>
 #include <cstring>
 #include <fcntl.h>
+#include <filesystem>
+#include <fstream>
+#include <linux/serial.h>
 #include <poll.h>
 #include <sstream>
 #include <stdexcept>
+#include <sys/ioctl.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -165,6 +169,30 @@ void BertecAM6817::open()
     throw std::runtime_error("Failed to open " + port_ + ": " + std::strerror(errno));
   }
 
+  // Attempt to enable FTDI 1 ms low-latency mode before configuring termios baud rate
+  if(latencyTimerMs() > 1)
+  {
+    serial_struct ser{};
+    if(::ioctl(fd_, TIOCGSERIAL, &ser) == 0)
+    {
+      ser.flags |= ASYNC_LOW_LATENCY;
+      ::ioctl(fd_, TIOCSSERIAL, &ser);
+    }
+    if(latencyTimerMs() > 1)
+    {
+      std::error_code ec;
+      const auto tty_name = std::filesystem::weakly_canonical(port_, ec).filename().string();
+      if(!tty_name.empty())
+      {
+        std::ofstream ofs("/sys/bus/usb-serial/devices/" + tty_name + "/latency_timer");
+        if(ofs)
+        {
+          ofs << "1\n";
+        }
+      }
+    }
+  }
+
   termios attrs{};
   if(::tcgetattr(fd_, &attrs) != 0)
   {
@@ -196,6 +224,23 @@ void BertecAM6817::open()
 
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
   stopStream();
+}
+
+int BertecAM6817::latencyTimerMs() const
+{
+  std::error_code ec;
+  const auto tty_name = std::filesystem::weakly_canonical(port_, ec).filename().string();
+  if(tty_name.empty())
+  {
+    return -1;
+  }
+  std::ifstream ifs("/sys/bus/usb-serial/devices/" + tty_name + "/latency_timer");
+  int val = -1;
+  if(ifs >> val)
+  {
+    return val;
+  }
+  return -1;
 }
 
 void BertecAM6817::close()

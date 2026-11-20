@@ -87,6 +87,9 @@ public:
   const CalibrationData & calibration() const noexcept { return calibration_; }
   const DeviceInfo & info() const noexcept { return info_; }
 
+  /** Read FTDI latency_timer in ms from sysfs, or -1 if unavailable. */
+  int latencyTimerMs() const;
+
 private:
   std::vector<uint8_t> readExact(std::size_t n, int timeout_ms);
   std::array<double, 6> convertRaw(const std::array<uint16_t, 8> & raw) const;

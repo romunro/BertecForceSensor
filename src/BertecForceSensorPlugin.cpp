@@ -43,6 +43,15 @@ void BertecForceSensor::init(mc_control::MCGlobalController & controller, const 
   try
   {
     device_->open();
+    const int latency_ms = device_->latencyTimerMs();
+    if(latency_ms > 1)
+    {
+      mc_rtc::log::warning(
+          "[BertecForceSensor] FTDI latency_timer on {} is {} ms (expected 1 ms). "
+          "Frames will still stream at 1000 Hz avg, but arrive in ~3-4 ms USB micro-batches. "
+          "Run `echo 1 | sudo tee /sys/bus/usb-serial/devices/ttyUSB0/latency_timer` or add a udev rule.",
+          port_, latency_ms);
+    }
     const auto info = device_->getInfo();
     const auto cal = device_->readCalibration();
     mc_rtc::log::success("[BertecForceSensor] Connected to {} (model: {}, serial: {}, rate: {} Hz)",
