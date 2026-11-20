@@ -69,13 +69,13 @@ Create a new extension file in `<superbuild>/extensions/bertec_force_sensor.cmak
 
 ```cmake
 AddProject(bertec_force_sensor
-  GITHUB_PRIVATE romunro/BertecForceSensor
+  GITHUB romunro/BertecForceSensor
   GIT_TAG origin/main
   DEPENDS mc_rtc
 )
 ```
 
-*(Or use `GIT_REPOSITORY <git-url>` instead of `GITHUB_PRIVATE` if hosted outside GitHub or locally.)*
+*(Or use `GITHUB_PRIVATE` if the repository is private, or `GIT_REPOSITORY <git-url>` if hosted elsewhere.)*
 
 Then build/update via the superbuild:
 
