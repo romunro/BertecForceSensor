@@ -3,12 +3,15 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <linux/serial.h>
 #include <poll.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sstream>
 #include <stdexcept>
 #include <sys/ioctl.h>
@@ -24,6 +27,7 @@ constexpr uint8_t kSyncByte = 0x7E;
 constexpr uint8_t kEscByte = 0x7D;
 constexpr uint8_t kEscXor = 0x20;
 constexpr std::size_t kPayloadSize = 17; // 1 byte seq + 8 * uint16 LE
+constexpr std::size_t kMaxRxBufBytes = 16384;
 
 constexpr uint8_t kCmdStopPing = 0x01;
 constexpr uint8_t kCmdGetInfo = 0x02;
@@ -69,7 +73,6 @@ CalibrationData parseCalibrationText(const std::string & text)
 
   while(std::getline(iss, line))
   {
-    // Trim whitespace
     const auto start = line.find_first_not_of(" \t\r\n");
     if(start == std::string::npos)
     {
@@ -149,6 +152,7 @@ CalibrationData parseCalibrationText(const std::string & text)
 BertecAM6817::BertecAM6817(std::string port, int timeout_ms)
 : port_(std::move(port)), timeout_ms_(timeout_ms)
 {
+  rx_buf_.reserve(4096);
 }
 
 BertecAM6817::~BertecAM6817()
@@ -294,12 +298,20 @@ std::vector<uint8_t> BertecAM6817::readExact(std::size_t n, int timeout_ms)
     {
       continue;
     }
+    if(pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+    {
+      throw std::runtime_error("Serial device disconnected (poll revents=" + std::to_string(pfd.revents) + ")");
+    }
 
     uint8_t buf[4096];
     const ssize_t got = ::read(fd_, buf, sizeof(buf));
     if(got > 0)
     {
       rx_buf_.insert(rx_buf_.end(), buf, buf + got);
+    }
+    else if(got == 0 || (got < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR))
+    {
+      throw std::runtime_error("Serial read failed or device disconnected");
     }
   }
 
@@ -389,7 +401,7 @@ void BertecAM6817::startStream()
   }
 }
 
-Sample BertecAM6817::readSample()
+bool BertecAM6817::tryPopFrame(std::uint8_t & seq_out, std::array<uint16_t, 8> & raw_out)
 {
   std::vector<uint8_t> payload;
   while(true)
@@ -403,27 +415,11 @@ Sample BertecAM6817::readSample()
       {
         rx_buf_.erase(rx_buf_.begin(), it_start);
       }
-      pollfd pfd{fd_, POLLIN, 0};
-      const int rc = ::poll(&pfd, 1, timeout_ms_);
-      if(rc < 0)
+      else if(it_start == rx_buf_.end() && rx_buf_.size() > kMaxRxBufBytes)
       {
-        if(errno == EINTR)
-        {
-          continue;
-        }
-        throw std::runtime_error("poll failed in readSample: " + std::string(std::strerror(errno)));
+        rx_buf_.clear();
       }
-      if(rc == 0)
-      {
-        throw std::runtime_error("Timed out waiting for stream frame");
-      }
-      uint8_t buf[4096];
-      const ssize_t got = ::read(fd_, buf, sizeof(buf));
-      if(got > 0)
-      {
-        rx_buf_.insert(rx_buf_.end(), buf, buf + got);
-      }
-      continue;
+      return false;
     }
 
     const std::size_t frame_len = static_cast<std::size_t>(it_end - (it_start + 1));
@@ -435,18 +431,80 @@ Sample BertecAM6817::readSample()
       continue;
     }
 
-    Sample s;
-    s.seq = payload[0];
+    seq_out = payload[0];
     for(std::size_t i = 0; i < 8; ++i)
     {
-      s.raw[i] = readU16LE(&payload[1 + 2 * i]);
+      raw_out[i] = readU16LE(&payload[1 + 2 * i]);
     }
-    s.wrench = convertRaw(s.raw);
-    return s;
+    return true;
   }
 }
 
-std::array<double, 6> BertecAM6817::convertRaw(const std::array<uint16_t, 8> & raw) const
+void BertecAM6817::drainAvailableNonBlocking()
+{
+  uint8_t buf[4096];
+  while(true)
+  {
+    const ssize_t got = ::read(fd_, buf, sizeof(buf));
+    if(got > 0)
+    {
+      rx_buf_.insert(rx_buf_.end(), buf, buf + got);
+      if(rx_buf_.size() > kMaxRxBufBytes)
+      {
+        break;
+      }
+    }
+    else if(got == 0 || (got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)))
+    {
+      break;
+    }
+    else
+    {
+      throw std::runtime_error("Serial read error during stream: " + std::string(std::strerror(errno)));
+    }
+  }
+}
+
+Sample BertecAM6817::readSample()
+{
+  uint8_t seq = 0;
+  std::array<uint16_t, 8> raw{};
+
+  while(!tryPopFrame(seq, raw))
+  {
+    pollfd pfd{fd_, POLLIN, 0};
+    const int rc = ::poll(&pfd, 1, timeout_ms_);
+    if(rc < 0)
+    {
+      if(errno == EINTR)
+      {
+        continue;
+      }
+      throw std::runtime_error("poll failed in readSample: " + std::string(std::strerror(errno)));
+    }
+    if(rc == 0)
+    {
+      throw std::runtime_error("Timed out waiting for stream frame");
+    }
+    if(pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+    {
+      throw std::runtime_error("Serial device disconnected (poll revents=" + std::to_string(pfd.revents) + ")");
+    }
+    drainAvailableNonBlocking();
+  }
+
+  Sample s;
+  s.seq = seq;
+  s.raw = raw;
+  s.timestamp = std::chrono::steady_clock::now();
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    s.wrench = convertRawUnlocked(s.raw);
+  }
+  return s;
+}
+
+std::array<double, 6> BertecAM6817::convertRawUnlocked(const std::array<uint16_t, 8> & raw) const
 {
   std::array<double, 6> out{};
   if(!calibration_.valid)
@@ -454,12 +512,9 @@ std::array<double, 6> BertecAM6817::convertRaw(const std::array<uint16_t, 8> & r
     return out;
   }
   std::array<double, 8> delta{};
+  for(std::size_t i = 0; i < 8; ++i)
   {
-    std::lock_guard<std::mutex> lock(data_mutex_);
-    for(std::size_t i = 0; i < 8; ++i)
-    {
-      delta[i] = static_cast<double>(raw[i]) - baseline_[i];
-    }
+    delta[i] = static_cast<double>(raw[i]) - baseline_[i];
   }
   for(std::size_t r = 0; r < 6; ++r)
   {
@@ -471,6 +526,23 @@ std::array<double, 6> BertecAM6817::convertRaw(const std::array<uint16_t, 8> & r
     out[r] = sum;
   }
   return out;
+}
+
+bool BertecAM6817::isWrenchWithinSanityLimits(const std::array<double, 6> & w) const noexcept
+{
+  if(max_range_multiplier_ <= 0.0 || calibration_.ranges.size() < 6)
+  {
+    return true;
+  }
+  for(std::size_t i = 0; i < 6; ++i)
+  {
+    const double limit = max_range_multiplier_ * calibration_.ranges[i];
+    if(!std::isfinite(w[i]) || (limit > 0.0 && std::abs(w[i]) > limit))
+    {
+      return false;
+    }
+  }
+  return true;
 }
 
 void BertecAM6817::tareBlocking(std::size_t n_samples)
@@ -513,12 +585,14 @@ void BertecAM6817::startAsync()
     return;
   }
   startStream();
+  stream_healthy_.store(true);
   running_.store(true);
   reader_thread_ = std::thread(&BertecAM6817::readerLoop, this);
 }
 
 void BertecAM6817::stopAsync()
 {
+  stream_healthy_.store(false);
   if(!running_.exchange(false))
   {
     return;
@@ -536,9 +610,16 @@ void BertecAM6817::requestTare(std::size_t n_samples)
   {
     return;
   }
+  std::lock_guard<std::mutex> lock(data_mutex_);
   tare_accum_.fill(0.0);
   tare_total_ = n_samples;
-  tare_remaining_.store(n_samples);
+  tare_remaining_ = n_samples;
+}
+
+bool BertecAM6817::isTaring() const noexcept
+{
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  return tare_remaining_ > 0;
 }
 
 Sample BertecAM6817::latestSample() const
@@ -549,53 +630,108 @@ Sample BertecAM6817::latestSample() const
 
 void BertecAM6817::readerLoop()
 {
+  // Best-effort attempt to elevate reader thread to SCHED_FIFO real-time priority
+  sched_param sch{};
+  sch.sched_priority = 50;
+  ::pthread_setschedparam(::pthread_self(), SCHED_FIFO, &sch);
+
   uint64_t count = 0;
   uint64_t dropped = 0;
+  uint64_t corrupted = 0;
+
   while(running_.load())
   {
     try
     {
-      Sample s = readSample();
-      if(has_prev_seq_)
+      pollfd pfd{fd_, POLLIN, 0};
+      const int rc = ::poll(&pfd, 1, timeout_ms_);
+      if(rc < 0)
       {
-        const uint8_t expected = static_cast<uint8_t>(prev_seq_ + 1);
-        if(s.seq != expected)
+        if(errno == EINTR)
         {
-          dropped += static_cast<uint8_t>(s.seq - expected);
+          continue;
         }
+        throw std::runtime_error("poll failed in readerLoop");
       }
-      prev_seq_ = s.seq;
-      has_prev_seq_ = true;
-      ++count;
-      s.sample_count = count;
-      s.dropped_frames = dropped;
-
-      const std::size_t rem = tare_remaining_.load();
-      if(rem > 0)
+      if(rc == 0)
       {
-        for(std::size_t c = 0; c < 8; ++c)
+        stream_healthy_.store(false);
+        continue;
+      }
+      if(pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+      {
+        stream_healthy_.store(false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        continue;
+      }
+
+      // Drain all available bytes from the kernel buffer so we never fall behind
+      drainAvailableNonBlocking();
+      const auto now = std::chrono::steady_clock::now();
+
+      uint8_t seq = 0;
+      std::array<uint16_t, 8> raw{};
+      bool got_any = false;
+      Sample newest{};
+
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      while(tryPopFrame(seq, raw))
+      {
+        if(has_prev_seq_)
         {
-          tare_accum_[c] += static_cast<double>(s.raw[c]);
+          const uint8_t expected = static_cast<uint8_t>(prev_seq_ + 1);
+          if(seq != expected)
+          {
+            dropped += static_cast<uint8_t>(seq - expected);
+          }
         }
-        if(rem == 1)
+        prev_seq_ = seq;
+        has_prev_seq_ = true;
+
+        if(tare_remaining_ > 0)
         {
-          std::lock_guard<std::mutex> lock(data_mutex_);
           for(std::size_t c = 0; c < 8; ++c)
           {
-            baseline_[c] = tare_accum_[c] / static_cast<double>(tare_total_);
+            tare_accum_[c] += static_cast<double>(raw[c]);
           }
-          s.wrench = {};
+          --tare_remaining_;
+          if(tare_remaining_ == 0 && tare_total_ > 0)
+          {
+            for(std::size_t c = 0; c < 8; ++c)
+            {
+              baseline_[c] = tare_accum_[c] / static_cast<double>(tare_total_);
+            }
+          }
         }
-        tare_remaining_.store(rem - 1);
+
+        const auto wrench = (tare_remaining_ > 0) ? std::array<double, 6>{} : convertRawUnlocked(raw);
+        if(!isWrenchWithinSanityLimits(wrench))
+        {
+          ++corrupted;
+          latest_.corrupted_frames = corrupted;
+          continue;
+        }
+
+        ++count;
+        newest.seq = seq;
+        newest.raw = raw;
+        newest.wrench = wrench;
+        newest.sample_count = count;
+        newest.dropped_frames = dropped;
+        newest.corrupted_frames = corrupted;
+        newest.timestamp = now;
+        got_any = true;
       }
 
+      if(got_any)
       {
-        std::lock_guard<std::mutex> lock(data_mutex_);
-        latest_ = s;
+        latest_ = newest;
+        stream_healthy_.store(true);
       }
     }
     catch(...)
     {
+      stream_healthy_.store(false);
       if(!running_.load())
       {
         break;

@@ -12,12 +12,22 @@ inject_to_robot_sensor: true
 
 # Prefix for datastore entries:
 #   <datastore_prefix>::wrench    (sva::ForceVecd)
-#   <datastore_prefix>::connected (bool)
+#   <datastore_prefix>::connected (bool - true only when connected AND not stale)
+#   <datastore_prefix>::stale     (bool - true if sample age exceeds watchdog_timeout_ms)
 #   <datastore_prefix>::tare      (std::function<void()>)
 datastore_prefix: BertecForceSensor
 
 # Number of 1 kHz samples to average for initial software tare on startup (0 = skip)
 tare_samples: 200
+
+# Watchdog timeout in milliseconds: marks stream stale if no valid frame arrives within this window (0 = disable)
+watchdog_timeout_ms: 20.0
+
+# Zero out the reported wrench if the stream becomes stale/disconnected (prevents holding a phantom force in closed loop)
+zero_on_stale: true
+
+# Reject single-frame UART bit-flip corruptions exceeding max_range_multiplier * EEPROM [Ranges] (0 = disable)
+max_range_multiplier: 3.0
 
 # Also log the 8 raw 16-bit ADC channels as <sensor_name>_raw
 log_raw: false

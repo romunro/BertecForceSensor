@@ -6,6 +6,7 @@
 #include <mc_rtc/gui/Label.h>
 #include <mc_rtc/logging.h>
 
+#include <chrono>
 #include <functional>
 
 namespace mc_plugin
@@ -35,11 +36,15 @@ void BertecForceSensor::init(mc_control::MCGlobalController & controller, const 
   robot_name_ = config("robot_name", std::string(""));
   datastore_prefix_ = config("datastore_prefix", std::string("BertecForceSensor"));
   tare_samples_ = config("tare_samples", 200);
+  watchdog_timeout_ms_ = config("watchdog_timeout_ms", 20.0);
+  max_range_multiplier_ = config("max_range_multiplier", 3.0);
+  zero_on_stale_ = config("zero_on_stale", true);
   inject_to_robot_sensor_ = config("inject_to_robot_sensor", true);
   log_raw_ = config("log_raw", false);
   enable_gui_ = config("gui", true);
 
   device_ = std::make_unique<bertec::BertecAM6817>(port_);
+  device_->setMaxRangeMultiplier(max_range_multiplier_);
   try
   {
     device_->open();
@@ -65,10 +70,12 @@ void BertecForceSensor::init(mc_control::MCGlobalController & controller, const 
 
     device_->startAsync();
     connected_ = true;
+    stale_ = false;
   }
   catch(const std::exception & e)
   {
     connected_ = false;
+    stale_ = true;
     mc_rtc::log::error("[BertecForceSensor] Failed to initialize on {}: {}", port_, e.what());
   }
 
@@ -96,7 +103,8 @@ void BertecForceSensor::before(mc_control::MCGlobalController & controller)
 
   auto & ctl = controller.controller();
   ctl.datastore().assign<sva::ForceVecd>(datastore_prefix_ + "::wrench", wrench_);
-  ctl.datastore().assign<bool>(datastore_prefix_ + "::connected", connected_);
+  ctl.datastore().assign<bool>(datastore_prefix_ + "::connected", connected_ && !stale_);
+  ctl.datastore().assign<bool>(datastore_prefix_ + "::stale", stale_);
 
   if(inject_to_robot_sensor_)
   {
@@ -128,13 +136,56 @@ void BertecForceSensor::updateWrench()
 {
   if(!connected_ || !device_)
   {
+    stale_ = true;
+    if(zero_on_stale_)
+    {
+      wrench_ = sva::ForceVecd::Zero();
+    }
     return;
   }
+
   const auto s = device_->latestSample();
-  wrench_ = sva::ForceVecd(Eigen::Vector3d(s.wrench[3], s.wrench[4], s.wrench[5]),
-                           Eigen::Vector3d(s.wrench[0], s.wrench[1], s.wrench[2]));
   sample_count_ = s.sample_count;
   dropped_frames_ = s.dropped_frames;
+  corrupted_frames_ = s.corrupted_frames;
+
+  if(s.sample_count == 0)
+  {
+    stale_ = true;
+    return;
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+  sample_age_ms_ = std::chrono::duration<double, std::milli>(now - s.timestamp).count();
+
+  const bool healthy = device_->isStreamHealthy() &&
+                       (watchdog_timeout_ms_ <= 0.0 || sample_age_ms_ <= watchdog_timeout_ms_);
+
+  if(!healthy)
+  {
+    stale_ = true;
+    if(!stale_warned_)
+    {
+      mc_rtc::log::error("[BertecForceSensor] Sensor stream stale or disconnected (age: {:.1f} ms > {:.1f} ms)",
+                         sample_age_ms_, watchdog_timeout_ms_);
+      stale_warned_ = true;
+    }
+    if(zero_on_stale_)
+    {
+      wrench_ = sva::ForceVecd::Zero();
+    }
+    return;
+  }
+
+  if(stale_warned_)
+  {
+    mc_rtc::log::success("[BertecForceSensor] Sensor stream recovered (age: {:.2f} ms)", sample_age_ms_);
+    stale_warned_ = false;
+  }
+  stale_ = false;
+
+  wrench_ = sva::ForceVecd(Eigen::Vector3d(s.wrench[3], s.wrench[4], s.wrench[5]),
+                           Eigen::Vector3d(s.wrench[0], s.wrench[1], s.wrench[2]));
   if(log_raw_)
   {
     for(Eigen::Index i = 0; i < 8; ++i)
@@ -153,7 +204,11 @@ void BertecForceSensor::registerDatastore(mc_control::MCGlobalController & contr
   }
   if(!ds.has(datastore_prefix_ + "::connected"))
   {
-    ds.make<bool>(datastore_prefix_ + "::connected", connected_);
+    ds.make<bool>(datastore_prefix_ + "::connected", connected_ && !stale_);
+  }
+  if(!ds.has(datastore_prefix_ + "::stale"))
+  {
+    ds.make<bool>(datastore_prefix_ + "::stale", stale_);
   }
   if(!ds.has(datastore_prefix_ + "::tare"))
   {
@@ -172,6 +227,9 @@ void BertecForceSensor::addLog(mc_control::MCGlobalController & controller)
   logger.addLogEntry(sensor_name_ + "_wrench", [this]() -> const sva::ForceVecd & { return wrench_; });
   logger.addLogEntry(sensor_name_ + "_sample_count", [this]() { return sample_count_; });
   logger.addLogEntry(sensor_name_ + "_dropped_frames", [this]() { return dropped_frames_; });
+  logger.addLogEntry(sensor_name_ + "_corrupted_frames", [this]() { return corrupted_frames_; });
+  logger.addLogEntry(sensor_name_ + "_age_ms", [this]() { return sample_age_ms_; });
+  logger.addLogEntry(sensor_name_ + "_stale", [this]() { return stale_; });
   if(log_raw_)
   {
     logger.addLogEntry(sensor_name_ + "_raw", [this]() -> const Eigen::VectorXd & { return raw_adc_; });
@@ -188,13 +246,22 @@ void BertecForceSensor::addGui(mc_control::MCGlobalController & controller)
   gui->addElement(
       {"Plugins", "BertecForceSensor"},
       mc_rtc::gui::Label("Port", [this]() { return port_; }),
-      mc_rtc::gui::Label("Status", [this]() { return connected_ ? "Connected" : "Disconnected"; }),
+      mc_rtc::gui::Label("Status",
+                         [this]() {
+                           if(!connected_)
+                           {
+                             return "Disconnected";
+                           }
+                           return stale_ ? "STALE / TIMEOUT" : "Streaming (OK)";
+                         }),
       mc_rtc::gui::ArrayLabel("Force [N]", {"Fx", "Fy", "Fz"},
                               [this]() -> const Eigen::Vector3d & { return wrench_.force(); }),
       mc_rtc::gui::ArrayLabel("Moment [Nm]", {"Mx", "My", "Mz"},
                               [this]() -> const Eigen::Vector3d & { return wrench_.couple(); }),
+      mc_rtc::gui::Label("Sample Age [ms]", [this]() { return sample_age_ms_; }),
       mc_rtc::gui::Label("Samples", [this]() { return std::to_string(sample_count_); }),
       mc_rtc::gui::Label("Dropped", [this]() { return std::to_string(dropped_frames_); }),
+      mc_rtc::gui::Label("Corrupted", [this]() { return std::to_string(corrupted_frames_); }),
       mc_rtc::gui::Button("Tare", [this]() {
         if(device_ && connected_)
         {

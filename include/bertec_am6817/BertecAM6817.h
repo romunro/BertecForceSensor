@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -39,6 +40,8 @@ struct Sample
   std::array<double, 6> wrench{};
   uint64_t sample_count = 0;
   uint64_t dropped_frames = 0;
+  uint64_t corrupted_frames = 0;
+  std::chrono::steady_clock::time_point timestamp{};
 };
 
 /**
@@ -76,10 +79,18 @@ public:
   void startAsync();
   void stopAsync();
   bool isStreaming() const noexcept { return running_.load(); }
+  bool isStreamHealthy() const noexcept { return stream_healthy_.load(); }
 
   /** Trigger a non-blocking software tare over the next n_samples in the background thread. */
   void requestTare(std::size_t n_samples = 200);
-  bool isTaring() const noexcept { return tare_remaining_.load() > 0; }
+  bool isTaring() const noexcept;
+
+  /**
+   * @brief Configure corruption sanity guard multiplier relative to EEPROM [Ranges].
+   * Frames exceeding max_range_multiplier * Range (due to UART bit flips) are rejected.
+   * Set <= 0.0 to disable. Default: 3.0.
+   */
+  void setMaxRangeMultiplier(double mult) noexcept { max_range_multiplier_ = mult; }
 
   /** Thread-safe snapshot of the most recent sample. */
   Sample latestSample() const;
@@ -92,7 +103,10 @@ public:
 
 private:
   std::vector<uint8_t> readExact(std::size_t n, int timeout_ms);
-  std::array<double, 6> convertRaw(const std::array<uint16_t, 8> & raw) const;
+  bool tryPopFrame(std::uint8_t & seq_out, std::array<uint16_t, 8> & raw_out);
+  void drainAvailableNonBlocking();
+  std::array<double, 6> convertRawUnlocked(const std::array<uint16_t, 8> & raw) const;
+  bool isWrenchWithinSanityLimits(const std::array<double, 6> & w) const noexcept;
   void readerLoop();
 
   std::string port_;
@@ -102,6 +116,7 @@ private:
 
   DeviceInfo info_{};
   CalibrationData calibration_{};
+  double max_range_multiplier_ = 3.0;
 
   mutable std::mutex data_mutex_;
   std::array<double, 8> baseline_{32768.0, 32768.0, 32768.0, 32768.0,
@@ -111,9 +126,10 @@ private:
   uint8_t prev_seq_ = 0;
 
   std::atomic<bool> running_{false};
+  std::atomic<bool> stream_healthy_{false};
   std::thread reader_thread_;
 
-  std::atomic<std::size_t> tare_remaining_{0};
+  std::size_t tare_remaining_ = 0;
   std::size_t tare_total_ = 0;
   std::array<double, 8> tare_accum_{};
 };

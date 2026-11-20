@@ -36,14 +36,21 @@ private:
   std::string robot_name_;
   std::string datastore_prefix_ = "BertecForceSensor";
   int tare_samples_ = 200;
+  double watchdog_timeout_ms_ = 20.0;
+  double max_range_multiplier_ = 3.0;
+  bool zero_on_stale_ = true;
   bool inject_to_robot_sensor_ = true;
   bool log_raw_ = false;
   bool enable_gui_ = true;
 
   bool connected_ = false;
+  bool stale_ = true;
+  bool stale_warned_ = false;
+  double sample_age_ms_ = 0.0;
   sva::ForceVecd wrench_ = sva::ForceVecd::Zero();
   uint64_t sample_count_ = 0;
   uint64_t dropped_frames_ = 0;
+  uint64_t corrupted_frames_ = 0;
   Eigen::VectorXd raw_adc_ = Eigen::VectorXd::Zero(8);
 };
 
