@@ -1,0 +1,26 @@
+# Serial port of the Bertec AM6817-E USB-to-serial adapter
+port: /dev/ttyUSB0
+
+# Name used for logging (<sensor_name>_wrench, etc.) and optional robot force sensor injection
+sensor_name: BertecForcePlate
+
+# Target robot name (empty = main controller.robot())
+robot_name: ""
+
+# If true and robot.hasForceSensor(sensor_name) is true, updates robot.forceSensor(sensor_name).wrench(...)
+inject_to_robot_sensor: true
+
+# Prefix for datastore entries:
+#   <datastore_prefix>::wrench    (sva::ForceVecd)
+#   <datastore_prefix>::connected (bool)
+#   <datastore_prefix>::tare      (std::function<void()>)
+datastore_prefix: BertecForceSensor
+
+# Number of 1 kHz samples to average for initial software tare on startup (0 = skip)
+tare_samples: 200
+
+# Also log the 8 raw 16-bit ADC channels as <sensor_name>_raw
+log_raw: false
+
+# Expose live readings and a "Tare" button under Plugins -> BertecForceSensor in the GUI
+gui: true
