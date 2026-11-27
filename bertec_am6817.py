@@ -82,7 +82,11 @@ class BertecAM6817:
     def open(self) -> None:
         if self._fd is not None:
             return
-        fd = os.open(self.port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        port = self.port
+        by_id = "/dev/serial/by-id/usb-Bertec_Corporation_AM6817-E-if00-port0"
+        if not os.path.exists(port) and os.path.exists(by_id):
+            port = os.path.realpath(by_id)
+        fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         attrs = termios.tcgetattr(fd)
         attrs[0] = 0  # iflag: raw
         attrs[1] = 0  # oflag: raw
